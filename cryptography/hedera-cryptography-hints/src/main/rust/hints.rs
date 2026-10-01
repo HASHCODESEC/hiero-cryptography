@@ -4,13 +4,13 @@ use ark_bls12_381::{g1::Config as G1Config, g2::Config as G2Config, Bls12_381};
 use ark_ec::hashing::{
     curve_maps::wb::WBMap, map_to_curve_hasher::MapToCurveBasedHasher, HashToCurve,
 };
-use ark_ec::pairing::Pairing;
+use ark_ec::pairing::{Pairing, PairingOutput};
 use ark_ec::{
     short_weierstrass::{Affine, Projective},
     AffineRepr, CurveGroup,
 };
 use ark_ff::{field_hashers::{DefaultFieldHasher, HashToField}, Field};
-use ark_poly::{univariate::DensePolynomial, Polynomial};
+use ark_poly::{univariate::DensePolynomial, EvaluationDomain, Polynomial, Radix2EvaluationDomain};
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 use ark_std::collections::HashMap;
 use ark_std::{ops::*, UniformRand};
@@ -22,6 +22,7 @@ use zeroize::Zeroize;
 use crate::kzg;
 use crate::utils;
 use crate::errors::*;
+use crate::transcript::Transcript;
 
 /// The size of input randomness
 pub const RANDOM_SIZE: usize = 32;
@@ -109,7 +110,7 @@ macro_rules! check_or_return_false {
 
 
 #[derive(Clone, Debug, PartialEq, CanonicalDeserialize, CanonicalSerialize)]
-/// hinTS aggregate signature
+/// hinTS aggregate signature, in the optimized layout of Sec 3.4.3 of the whitepaper
 pub struct ThresholdSignature {
     /// aggregate public key (aPK in the paper)
     agg_pk: G1AffinePoint,
@@ -128,17 +129,10 @@ pub struct ThresholdSignature {
     qz_of_tau_com: G1AffinePoint,
     /// commitment to the ParSum polynomial ([ParSum(τ)]_1 in the paper)
     parsum_of_tau_com: G1AffinePoint,
+    /// commitment to the merged quotient polynomial ([Q^mrg(τ)]_1 in the paper)
+    q_mrg_of_tau_com: G1AffinePoint,
 
-    /// commitment to the ParSum well-formedness quotient polynomial
-    q1_of_tau_com: G1AffinePoint,
-    /// commitment to the ParSum check at omega^{n-1} quotient polynomial
-    q3_of_tau_com: G1AffinePoint,
-    /// commitment to the bitmap well-formedness quotient polynomial
-    q2_of_tau_com: G1AffinePoint,
-    /// commitment to the bitmap check at omega^{n-1} quotient polynomial
-    q4_of_tau_com: G1AffinePoint,
-
-    /// merged opening proof for all openings at x = r
+    /// opening proof at x = r for Q = Q^mrg + χ_op·ParSum + χ_op^2·B + χ_op^3·W
     opening_proof_r: G1AffinePoint,
     /// proof for the ParSum opening at x = r / ω
     opening_proof_r_div_ω: G1AffinePoint,
@@ -147,18 +141,12 @@ pub struct ThresholdSignature {
     parsum_of_r: F,
     /// polynomial evaluation of ParSum(x) at x = r / ω
     parsum_of_r_div_ω: F,
-    /// polynomial evaluation of W(x) at x = r
+    /// evaluation at x = r of the verification key's weight polynomial W(x)
     w_of_r: F,
     /// polynomial evaluation of bitmap B(x) at x = r
     b_of_r: F,
-    /// polynomial evaluation of quotient Q1(x) at x = r
-    q1_of_r: F,
-    /// polynomial evaluation of quotient Q3(x) at x = r
-    q3_of_r: F,
-    /// polynomial evaluation of quotient Q2(x) at x = r
-    q2_of_r: F,
-    /// polynomial evaluation of quotient Q4(x) at x = r
-    q4_of_r: F,
+    /// polynomial evaluation of the merged quotient Q^mrg(x) at x = r
+    q_mrg_of_r: F,
 }
 
 #[derive(Clone, Debug, PartialEq, CanonicalDeserialize, CanonicalSerialize)]
@@ -698,7 +686,8 @@ impl HinTS {
         Ok(lhs == rhs)
     }
 
-    /// aggregates partial signatures to construct a threshold signature
+    /// aggregates partial signatures to construct a threshold signature; returns InvalidInput,
+    /// rather than a signature that cannot verify, if the inputs don't satisfy the hinTS relations
     pub fn aggregate(
         crs: &CRS,
         ak: &AggregationKey,
@@ -725,191 +714,19 @@ impl HinTS {
             return Err(HinTSError::InvalidNetworkSize(n));
         }
 
-        let n_inv = F::from(1) / F::from(n as u64);
+        let witness = assemble_witness(ak, partial_signatures)?;
+        let (π, exact) = prove(crs, ak, vk, &witness)?;
 
-        // compute bitmap based on entries in partial_signatures
-        let mut bitmap: Vec<F> = vec![F::from(0); n];
-        for (i, _sig) in partial_signatures.iter() {
-            // Validate party ID is within bounds: 0 <= i <= n - 2
-            // Recall that we reserve location n - 1 for the hinTS scheme,
-            // so the last valid signer ID is n - 2
-            if *i > (n - 2) {
-                return Err(HinTSError::InvalidInput(
-                    format!("Invalid party ID {}: must be <= n - 2 ({})", i, n - 2)
-                ));
-            }
-            bitmap[*i] = F::from(1);
+        // an honest witness satisfies all four relations on the whole domain, so a remainder
+        // means the inputs disagree with each other (e.g. an aggregation key that gives the
+        // reserved slot a weight); refuse, rather than emit a signature that cannot verify
+        if !exact {
+            return Err(HinTSError::InvalidInput(
+                "aggregation inputs do not satisfy the hinTS relations".to_string()
+            ));
         }
 
-        //adjust the weights and bitmap polynomials
-        // the weights vector is of size power of 2 - 1; lets pad
-        let mut weights = ak.weights.clone();
-        //compute sum of weights of active signers
-        let total_active_weight = bitmap
-            .iter()
-            .zip(weights.iter())
-            .fold(F::from(0), |acc, (&x, &y)| acc + (x * y));
-
-        //weight's last element must the additive inverse of active weight
-        weights[n - 1] = F::from(0) - total_active_weight;
-        // last element of bitmap must be 1 for our scheme
-        bitmap[n - 1] = F::from(1);
-
-        //compute all the scalars we will need in the prover
-        let ω: F = utils::nth_root_of_unity(n).ok_or(
-            HinTSError::CryptographyCatastrophe(
-                format!("Unable to construct Radix2EvaluationDomain for n = {}", n)
-            )
-        )?;
-        let ω_inv: F = F::from(1) / ω;
-
-        //compute all the polynomials we will need in the prover
-        let z_of_x = utils::compute_vanishing_poly(n); //returns Z(X) = X^n - 1
-        let l_n_minus_1_of_x = utils::lagrange_poly(n, n - 1).ok_or(
-            HinTSError::CryptographyCatastrophe(
-                format!("Unable to compute Lagrange<n,i>(x) for i = {}, n = {}", n - 1, n)
-            )
-        )?;
-        let w_of_x = utils::interpolate_poly_over_mult_subgroup(&weights).ok_or(
-            HinTSError::CryptographyCatastrophe(
-                format!("Unable to construct Radix2EvaluationDomain for n = {}", weights.len())
-            )
-        )?;
-        let b_of_x = utils::interpolate_poly_over_mult_subgroup(&bitmap).ok_or(
-            HinTSError::CryptographyCatastrophe(
-                format!("Unable to construct Radix2EvaluationDomain for n = {}", bitmap.len())
-            )
-        )?;
-        let psw_of_x = compute_psw_poly(&weights, &bitmap)?;
-        let psw_of_x_div_ω = utils::poly_domain_mult_ω(&psw_of_x, &ω_inv);
-
-        //ParSumW(X) = ParSumW(X/ω) + W(X) · b(X) + Z(X) · Q1(X)
-        let t_of_x = psw_of_x.sub(&psw_of_x_div_ω).sub(&w_of_x.mul(&b_of_x));
-        let psw_wff_q_of_x = t_of_x.div(&z_of_x);
-
-        //L_{n−1}(X) · ParSumW(X) = Z(X) · Q2(X)
-        let t_of_x = l_n_minus_1_of_x.mul(&psw_of_x);
-        let psw_check_q_of_x = t_of_x.div(&z_of_x);
-
-        //b(X) · b(X) − b(X) = Z(X) · Q3(X)
-        let t_of_x = b_of_x.mul(&b_of_x).sub(&b_of_x);
-        let b_wff_q_of_x = t_of_x.div(&z_of_x);
-
-        //L_{n−1}(X) · (b(X) - 1) = Z(X) · Q4(X)
-        let one_poly = utils::compute_constant_poly(&F::from(1));
-        let t_of_x = l_n_minus_1_of_x.mul(&b_of_x.sub(&one_poly));
-        let b_check_q_of_x = t_of_x.div(&z_of_x);
-
-        let qz_com = inner_product(&ak.qz_terms, &bitmap);
-        let qx_com = inner_product(&ak.qx_terms, &bitmap);
-        let qx_mul_tau_com = inner_product(&ak.qx_mul_tau_terms, &bitmap);
-
-        // aggregate pubkey is the sum of all active public keys, multiplied by n_inv
-        // this is computed using the fn for inner product argument with bitmap
-        let agg_pk = inner_product(&ak.pks, &bitmap).mul(n_inv).into_affine();
-
-        // aggregate sig is the sum of all partial signatures, multiplied by n_inv
-        let partial_sigs = partial_signatures
-            .values()
-            .map(|x| x.to_owned())
-            .collect::<Vec<PartialSignature>>();
-        let agg_sig = add::<G2AffinePoint>(partial_sigs).mul(n_inv).into_affine();
-
-        let parsum_of_tau_com = KZG::commit_g1(&crs, &psw_of_x)?;
-        let w_of_tau_com = KZG::commit_g1(&crs, &w_of_x)?;
-        let b_of_tau_com = KZG::commit_g1(&crs, &b_of_x)?;
-        let q1_of_tau_com = KZG::commit_g1(&crs, &psw_wff_q_of_x)?;
-        let q2_of_tau_com = KZG::commit_g1(&crs, &b_wff_q_of_x)?;
-        let q3_of_tau_com = KZG::commit_g1(&crs, &psw_check_q_of_x)?;
-        let q4_of_tau_com = KZG::commit_g1(&crs, &b_check_q_of_x)?;
-
-        // RO(SK, W, B, ParSum, Qx, Qz, Qx(τ ) · τ, Q1, Q2, Q3, Q4)
-        let r = random_oracle(
-            vk.sk_of_tau_com,
-            vk.h_1,
-            agg_pk,
-            total_active_weight,
-            vk.w_of_tau_com,
-            b_of_tau_com,
-            parsum_of_tau_com,
-            qx_com,
-            qz_com,
-            qx_mul_tau_com,
-            q1_of_tau_com,
-            q2_of_tau_com,
-            q3_of_tau_com,
-            q4_of_tau_com,
-        )?;
-        let r_div_ω: F = r / ω;
-
-        let psw_of_r_proof = KZG::compute_opening_proof(&crs, &psw_of_x, &r)?;
-        let w_of_r_proof = KZG::compute_opening_proof(&crs, &w_of_x, &r)?;
-        let b_of_r_proof = KZG::compute_opening_proof(&crs, &b_of_x, &r)?;
-        let psw_wff_q_of_r_proof = KZG::compute_opening_proof(&crs, &psw_wff_q_of_x, &r)?;
-        let psw_check_q_of_r_proof = KZG::compute_opening_proof(&crs, &psw_check_q_of_x, &r)?;
-        let b_wff_q_of_r_proof = KZG::compute_opening_proof(&crs, &b_wff_q_of_x, &r)?;
-        let b_check_q_of_r_proof = KZG::compute_opening_proof(&crs, &b_check_q_of_x, &r)?;
-
-        let s = kzg_batch_argument_random_oracle(
-            &[
-                &parsum_of_tau_com,
-                &w_of_tau_com,
-                &b_of_tau_com,
-                &q1_of_tau_com,
-                &q3_of_tau_com,
-                &q2_of_tau_com,
-                &q4_of_tau_com
-            ],
-            &[
-                &psw_of_x.evaluate(&r),
-                &w_of_x.evaluate(&r),
-                &b_of_x.evaluate(&r),
-                &psw_wff_q_of_x.evaluate(&r),
-                &psw_check_q_of_x.evaluate(&r),
-                &b_wff_q_of_x.evaluate(&r),
-                &b_check_q_of_x.evaluate(&r)
-            ],
-        )?;
-
-        // batched opening argument as it is for the same point r
-        let merged_proof: G1AffinePoint = (psw_of_r_proof
-            + w_of_r_proof.mul(s.pow([1]))
-            + b_of_r_proof.mul(s.pow([2]))
-            + psw_wff_q_of_r_proof.mul(s.pow([3]))
-            + psw_check_q_of_r_proof.mul(s.pow([4]))
-            + b_wff_q_of_r_proof.mul(s.pow([5]))
-            + b_check_q_of_r_proof.mul(s.pow([6])))
-        .into();
-
-        Ok(ThresholdSignature {
-            agg_pk: agg_pk.clone(),
-            agg_sig: agg_sig.clone(),
-            agg_weight: total_active_weight,
-
-            parsum_of_r_div_ω: psw_of_x.evaluate(&r_div_ω),
-            opening_proof_r_div_ω: KZG::compute_opening_proof(&crs, &psw_of_x, &r_div_ω)?,
-
-            parsum_of_r: psw_of_x.evaluate(&r),
-            w_of_r: w_of_x.evaluate(&r),
-            b_of_r: b_of_x.evaluate(&r),
-            q1_of_r: psw_wff_q_of_x.evaluate(&r),
-            q3_of_r: psw_check_q_of_x.evaluate(&r),
-            q2_of_r: b_wff_q_of_x.evaluate(&r),
-            q4_of_r: b_check_q_of_x.evaluate(&r),
-
-            opening_proof_r: merged_proof.into(),
-
-            parsum_of_tau_com: parsum_of_tau_com,
-            b_of_tau_com: b_of_tau_com,
-            q1_of_tau_com: q1_of_tau_com,
-            q3_of_tau_com: q3_of_tau_com,
-            q2_of_tau_com: q2_of_tau_com,
-            q4_of_tau_com: q4_of_tau_com,
-
-            qz_of_tau_com: qz_com,
-            qx_of_tau_com: qx_com,
-            qx_of_tau_mul_tau_com: qx_mul_tau_com,
-        })
+        Ok(π)
     }
 
     /// verifies whether the threshold signature is valid and
@@ -938,9 +755,7 @@ impl HinTS {
         check_or_return_false!(denominator * π.agg_weight > numerator * vk.total_weight);
 
         // verify the signature first
-        let lhs = <Curve as Pairing>::pairing(&π.agg_pk, hash_to_g2(msg)?);
-        let rhs = <Curve as Pairing>::pairing(vk.g_0, &π.agg_sig);
-        check_or_return_false!(lhs == rhs);
+        check_or_return_false!(bls_check(msg, vk, π)?);
 
         // compute nth root of unity
         let ω: F = utils::nth_root_of_unity(vk.n).ok_or(
@@ -949,75 +764,447 @@ impl HinTS {
             )
         )?;
 
-        //RO(SK, W, B, ParSum, Qx, Qz, Qx(τ ) · τ, Q1, Q2, Q3, Q4)
-        let r = random_oracle(
-            vk.sk_of_tau_com,
-            vk.h_1,
-            π.agg_pk,
-            π.agg_weight,
-            vk.w_of_tau_com,
-            π.b_of_tau_com,
-            π.parsum_of_tau_com,
-            π.qx_of_tau_com,
-            π.qz_of_tau_com,
-            π.qx_of_tau_mul_tau_com,
-            π.q1_of_tau_com,
-            π.q2_of_tau_com,
-            π.q3_of_tau_com,
-            π.q4_of_tau_com,
-        )?;
+        // the three challenges, drawn exactly as the aggregator drew them
+        let (χ_q, r, χ_op) = derive_challenges(vk, π)?;
 
-        // verify the polynomial openings at r and r / ω
-        check_or_return_false!(verify_openings_in_proof(vk, π, r)?);
+        check_or_return_false!(merged_relation_check(vk, π, ω, χ_q, r));
+        check_or_return_false!(opening_at_r_check(vk, π, r, χ_op));
+        check_or_return_false!(opening_at_r_div_ω_check(vk, π, r / ω));
 
-        // this takes logarithmic computation, but concretely efficient
-        let vanishing_of_r: F = r.pow([vk.n as u64]) - F::from(1);
-
-        // compute L_i(r) using the relation L_i(x) = Z_V(x) / ( Z_V'(x) (x - ω^i) )
-        // where Z_V'(x)^-1 = x / N for N = |V|.
-        let ω_pow_n_minus_1 = ω.pow([(vk.n as u64) - 1]);
-        let l_n_minus_1_of_r =
-            (ω_pow_n_minus_1 / F::from(vk.n as u64)) * (vanishing_of_r / (r - ω_pow_n_minus_1));
-
-        //assert polynomial identity B(x) SK(x) = ask + Q_z(x) Z(x) + Q_x(x) x
-        let lhs = <Curve as Pairing>::pairing(&π.b_of_tau_com, &vk.sk_of_tau_com);
-        let x1 = <Curve as Pairing>::pairing(&π.qz_of_tau_com, &vk.z_of_tau_com);
-        let x2 = <Curve as Pairing>::pairing(&π.qx_of_tau_com, &vk.h_1);
-        let x3 = <Curve as Pairing>::pairing(&π.agg_pk, &vk.h_0);
-        let rhs = x1.add(x2).add(x3);
-        check_or_return_false!(lhs == rhs);
-
-        //assert checks on the public part
-
-        //ParSumW(r) − ParSumW(r/ω) − W(r) · b(r) = Q(r) · (r^n − 1)
-        let lhs = π.parsum_of_r - π.parsum_of_r_div_ω - π.w_of_r * π.b_of_r;
-        let rhs = π.q1_of_r * vanishing_of_r;
-        check_or_return_false!(lhs == rhs);
-
-        //Ln−1(X) · ParSumW(X) = Z(X) · Q2(X)
-        //TODO: compute l_n_minus_1_of_r in verifier -- dont put it in the proof.
-        let lhs = l_n_minus_1_of_r * π.parsum_of_r;
-        let rhs = vanishing_of_r * π.q3_of_r;
-        check_or_return_false!(lhs == rhs);
-
-        //b(r) * b(r) - b(r) = Q(r) · (r^n − 1)
-        let lhs = π.b_of_r * π.b_of_r - π.b_of_r;
-        let rhs = π.q2_of_r * vanishing_of_r;
-        check_or_return_false!(lhs == rhs);
-
-        //Ln−1(X) · (b(X) − 1) = Z(X) · Q4(X)
-        let lhs = l_n_minus_1_of_r * (π.b_of_r - F::from(1));
-        let rhs = vanishing_of_r * π.q4_of_r;
-        check_or_return_false!(lhs == rhs);
-
-        //run the degree check e([Qx(τ)]_1, [τ]_2) ?= e([Qx(τ)·τ]_1, [1]_2)
-        let lhs = x2;
-        let rhs = <Curve as Pairing>::pairing(&π.qx_of_tau_mul_tau_com, &vk.h_0);
-
-        check_or_return_false!(lhs == rhs);
+        // e([Q_x(τ)]_1, [τ]_2) appears in both remaining checks, so compute it once
+        let e_qx_tau = <Curve as Pairing>::pairing(&π.qx_of_tau_com, &vk.h_1);
+        check_or_return_false!(sumcheck_check(vk, π, &e_qx_tau));
+        check_or_return_false!(degree_check(vk, π, &e_qx_tau));
 
         Ok(true)
     }
+}
+
+/// domain separators for the three Fiat-Shamir rounds of the aggregate signature (Sec 3.4.3
+/// of the whitepaper); none is shared with the four-quotient layout that preceded it
+const DST_QUOTIENT_MERGE: &[u8] = b"HINTS_SIG_BLS12381:FIAT_SHAMIR_V2_QUOTIENT_MERGE";
+const DST_EVALUATION_POINT: &[u8] = b"HINTS_SIG_BLS12381:FIAT_SHAMIR_V2_EVALUATION_POINT";
+const DST_OPENING_BATCH: &[u8] = b"HINTS_SIG_BLS12381:FIAT_SHAMIR_V2_OPENING_BATCH";
+
+/// What the aggregator proves: the bitmap and running sums over the n slots, and the
+/// aggregate values computed from the signers' public material. `aggregate` assembles it
+/// honestly from the partial signatures; tests hand `prove` tampered witnesses instead, to
+/// check that the verifier rejects each way of cheating.
+#[derive(Clone)]
+struct Witness {
+    /// b_i for each slot; the reserved slot n - 1 is always set
+    bitmap: Vec<F>,
+    /// inclusive running sums of b_i · w_i, where the reserved slot carries weight -w,
+    /// so the sum returns to zero there
+    parsum: Vec<F>,
+    /// the claimed aggregate weight w
+    agg_weight: F,
+    /// aggregate public key, scaled by 1/n
+    agg_pk: G1AffinePoint,
+    /// aggregate signature, scaled by 1/n
+    agg_sig: G2AffinePoint,
+    /// [Q_z(τ)]_1, summed from the aggregation key's pre-processed hints
+    qz_of_tau_com: G1AffinePoint,
+    /// [Q_x(τ)]_1, summed likewise
+    qx_of_tau_com: G1AffinePoint,
+    /// [Q_x(τ) · τ]_1, summed likewise
+    qx_of_tau_mul_tau_com: G1AffinePoint,
+}
+
+/// assembles the witness for a set of partial signatures, exactly as an honest aggregator does
+fn assemble_witness(
+    ak: &AggregationKey,
+    partial_signatures: &HashMap<usize, PartialSignature>,
+) -> Result<Witness, HinTSError> {
+    let n = ak.n;
+    let n_inv = F::from(1) / F::from(n as u64);
+
+    // compute bitmap based on entries in partial_signatures
+    let mut bitmap: Vec<F> = vec![F::from(0); n];
+    for (i, _sig) in partial_signatures.iter() {
+        // Validate party ID is within bounds: 0 <= i <= n - 2
+        // Recall that we reserve location n - 1 for the hinTS scheme,
+        // so the last valid signer ID is n - 2
+        if *i > (n - 2) {
+            return Err(HinTSError::InvalidInput(
+                format!("Invalid party ID {}: must be <= n - 2 ({})", i, n - 2)
+            ));
+        }
+        bitmap[*i] = F::from(1);
+    }
+
+    //compute sum of weights of active signers
+    let agg_weight = bitmap
+        .iter()
+        .zip(ak.weights.iter())
+        .fold(F::from(0), |acc, (&b, &w)| acc + (b * w));
+
+    // the reserved slot is always set and carries weight -w, so that the running sum over
+    // all n slots returns to zero exactly there
+    bitmap[n - 1] = F::from(1);
+    let mut weights = ak.weights.clone();
+    weights[n - 1] = F::from(0) - agg_weight;
+    let parsum = running_sums(&weights, &bitmap);
+
+    // aggregate pubkey is the sum of all active public keys, multiplied by n_inv
+    let agg_pk = inner_product(&ak.pks, &bitmap).mul(n_inv).into_affine();
+
+    // aggregate sig is the sum of all partial signatures, multiplied by n_inv
+    let agg_sig = add::<G2AffinePoint>(partial_signatures.values().cloned())
+        .mul(n_inv)
+        .into_affine();
+
+    let qz_of_tau_com = inner_product(&ak.qz_terms, &bitmap);
+    let qx_of_tau_com = inner_product(&ak.qx_terms, &bitmap);
+    let qx_of_tau_mul_tau_com = inner_product(&ak.qx_mul_tau_terms, &bitmap);
+
+    Ok(Witness {
+        bitmap,
+        parsum,
+        agg_weight,
+        agg_pk,
+        agg_sig,
+        qz_of_tau_com,
+        qx_of_tau_com,
+        qx_of_tau_mul_tau_com,
+    })
+}
+
+/// computes the signature for a witness (Sec 3.4.3 of the whitepaper). Returns it together
+/// with whether the merged relation divided exactly by Z(X), which it does for every honest
+/// witness; `aggregate` refuses to emit a signature when it does not.
+fn prove(
+    crs: &CRS,
+    ak: &AggregationKey,
+    vk: &VerificationKey,
+    witness: &Witness,
+) -> Result<(ThresholdSignature, bool), HinTSError> {
+    let n = ak.n;
+    let domain = Radix2EvaluationDomain::<F>::new(n).ok_or(
+        HinTSError::CryptographyCatastrophe(
+            format!("Unable to construct Radix2EvaluationDomain for n = {}", n)
+        )
+    )?;
+    let ω: F = domain.group_gen;
+
+    let b_of_x = interpolate(&witness.bitmap)?;
+    let psw_of_x = interpolate(&witness.parsum)?;
+    // the polynomial vk.w_of_tau_com commits to; the reserved slot carries no weight in it
+    let w_of_x = interpolate(&ak.weights)?;
+    let l_n_minus_1_of_x = utils::lagrange_poly(n, n - 1).ok_or(
+        HinTSError::CryptographyCatastrophe(
+            format!("Unable to compute Lagrange<n,i>(x) for i = {}, n = {}", n - 1, n)
+        )
+    )?;
+
+    let b_of_tau_com = KZG::commit_g1(crs, &b_of_x)?;
+    let parsum_of_tau_com = KZG::commit_g1(crs, &psw_of_x)?;
+
+    // Round 1: χ_Q is drawn before the merged quotient exists
+    let mut transcript = Transcript::new();
+    absorb_round_1(
+        &mut transcript,
+        vk,
+        &witness.agg_pk,
+        &witness.agg_weight,
+        &b_of_tau_com,
+        &parsum_of_tau_com,
+        &witness.qx_of_tau_com,
+        &witness.qz_of_tau_com,
+        &witness.qx_of_tau_mul_tau_com,
+    )?;
+    let χ_q: F = transcript.challenge(DST_QUOTIENT_MERGE);
+
+    // The four relations of Sec 3.4.3, each of which must vanish on the whole domain:
+    //   P1 = PS(X) - PS(X/ω) - (W(X) - w·L_{n-1}(X))·B(X)   the running sum steps by b_i·w_i
+    //   P2 = B(X)·B(X) - B(X)                              the bitmap is binary
+    //   P3 = L_{n-1}(X)·PS(X)                              the running sum ends at zero
+    //   P4 = L_{n-1}(X)·(B(X) - 1)                         the reserved slot is set
+    // The paper numbers slots from 1 and its running sum is exclusive (zero at the first
+    // slot, hence L_1·PS). Ours is inclusive: the reserved slot's weight -w is the last term,
+    // so the sum returns to zero at the reserved slot itself, and P3 and P4 share L_{n-1}.
+    // Our running sum at slot i is the paper's at slot i + 2, i.e. its next slot, which is
+    // also why the recurrence looks back to X/ω and ParSum is opened at r/ω rather than rω.
+    let psw_of_x_div_ω = utils::poly_domain_mult_ω(&psw_of_x, &(F::from(1) / ω));
+    let w_adj_of_x = &w_of_x - &utils::poly_eval_mult_c(&l_n_minus_1_of_x, &witness.agg_weight);
+    let one = utils::compute_constant_poly(&F::from(1));
+    let p1_of_x = &(&psw_of_x - &psw_of_x_div_ω) - &(&w_adj_of_x * &b_of_x);
+    let p2_of_x = &(&b_of_x * &b_of_x) - &b_of_x;
+    let p3_of_x = &l_n_minus_1_of_x * &psw_of_x;
+    let p4_of_x = &l_n_minus_1_of_x * &(&b_of_x - &one);
+    let p_mrg_of_x = merge_polys(&[&p1_of_x, &p2_of_x, &p3_of_x, &p4_of_x], &χ_q);
+
+    // Z(X) = X^n - 1 is sparse, so this division takes linear time
+    let (q_mrg_of_x, remainder) = p_mrg_of_x.divide_by_vanishing_poly(domain).ok_or(
+        HinTSError::CryptographyCatastrophe(
+            format!("Unable to divide by the vanishing polynomial for n = {}", n)
+        )
+    )?;
+    let exact = remainder.coeffs.iter().all(|c| *c == F::from(0));
+    let q_mrg_of_tau_com = KZG::commit_g1(crs, &q_mrg_of_x)?;
+
+    // Round 2: r binds [Q_mrg(τ)]_1, so the merged quotient cannot be chosen once r is known
+    absorb_round_2(&mut transcript, &q_mrg_of_tau_com)?;
+    let r: F = transcript.challenge(DST_EVALUATION_POINT);
+    let r_div_ω: F = r / ω;
+
+    let parsum_of_r = psw_of_x.evaluate(&r);
+    let parsum_of_r_div_ω = psw_of_x.evaluate(&r_div_ω);
+    let w_of_r = w_of_x.evaluate(&r);
+    let b_of_r = b_of_x.evaluate(&r);
+    let q_mrg_of_r = q_mrg_of_x.evaluate(&r);
+
+    // Round 3: χ_op is drawn once the claimed evaluations are fixed
+    absorb_round_3(&mut transcript, &parsum_of_r, &parsum_of_r_div_ω, &w_of_r, &b_of_r, &q_mrg_of_r)?;
+    let χ_op: F = transcript.challenge(DST_OPENING_BATCH);
+
+    // a single opening at r, of Q = Q_mrg + χ_op·PS + χ_op^2·B + χ_op^3·W; the verifier
+    // rebuilds [Q(τ)]_1 from the commitments, so it is not part of the signature
+    let q_of_x = merge_polys(&[&q_mrg_of_x, &psw_of_x, &b_of_x, &w_of_x], &χ_op);
+    let opening_proof_r = KZG::compute_opening_proof(crs, &q_of_x, &r)?;
+    let opening_proof_r_div_ω = KZG::compute_opening_proof(crs, &psw_of_x, &r_div_ω)?;
+
+    let π = ThresholdSignature {
+        agg_pk: witness.agg_pk,
+        agg_weight: witness.agg_weight,
+        agg_sig: witness.agg_sig,
+
+        b_of_tau_com,
+        qx_of_tau_com: witness.qx_of_tau_com,
+        qx_of_tau_mul_tau_com: witness.qx_of_tau_mul_tau_com,
+        qz_of_tau_com: witness.qz_of_tau_com,
+        parsum_of_tau_com,
+        q_mrg_of_tau_com,
+
+        opening_proof_r,
+        opening_proof_r_div_ω,
+
+        parsum_of_r,
+        parsum_of_r_div_ω,
+        w_of_r,
+        b_of_r,
+        q_mrg_of_r,
+    };
+    Ok((π, exact))
+}
+
+/// inclusive running sums of b_i · w_i over the slots
+fn running_sums(weights: &[Weight], bitmap: &[F]) -> Vec<F> {
+    let mut sum = F::from(0);
+    weights
+        .iter()
+        .zip(bitmap.iter())
+        .map(|(&w, &b)| {
+            sum += b * w;
+            sum
+        })
+        .collect()
+}
+
+/// interpolates evaluations over the multiplicative subgroup of their size
+fn interpolate(evals: &Vec<F>) -> Result<DensePolynomial<F>, HinTSError> {
+    utils::interpolate_poly_over_mult_subgroup(evals).ok_or(
+        HinTSError::CryptographyCatastrophe(
+            format!("Unable to construct Radix2EvaluationDomain for n = {}", evals.len())
+        )
+    )
+}
+
+/// p_0 + χ·p_1 + χ^2·p_2 + ..., by Horner's rule
+fn merge_polys(polys: &[&DensePolynomial<F>], χ: &F) -> DensePolynomial<F> {
+    polys
+        .iter()
+        .rev()
+        .fold(DensePolynomial { coeffs: vec![] }, |acc, p| &utils::poly_eval_mult_c(&acc, χ) + *p)
+}
+
+/// a_0 + χ·a_1 + χ^2·a_2 + ..., by Horner's rule: `merge_polys` evaluated at a point
+fn merge_scalars(values: &[F], χ: &F) -> F {
+    values.iter().rev().fold(F::from(0), |acc, v| acc * χ + v)
+}
+
+/// [a_0] + χ·[a_1] + χ^2·[a_2] + ..., by Horner's rule: `merge_polys` in the exponent
+fn merge_points(points: &[G1AffinePoint], χ: &F) -> G1AffinePoint {
+    points
+        .iter()
+        .rev()
+        .fold(G1AffinePoint::zero().into_group(), |acc, p| acc * χ + *p)
+        .into_affine()
+}
+
+/// Round 1 of the transcript (T_1 in the whitepaper): the verification key, the aggregate
+/// values, and every commitment fixed before the quotients are merged. [Q_mrg(τ)]_1 cannot
+/// be absorbed here: χ_Q, which defines it, is this round's output.
+fn absorb_round_1(
+    transcript: &mut Transcript,
+    vk: &VerificationKey,
+    agg_pk: &G1AffinePoint,
+    agg_weight: &F,
+    b_of_tau_com: &G1AffinePoint,
+    parsum_of_tau_com: &G1AffinePoint,
+    qx_of_tau_com: &G1AffinePoint,
+    qz_of_tau_com: &G1AffinePoint,
+    qx_of_tau_mul_tau_com: &G1AffinePoint,
+) -> Result<(), HinTSError> {
+    transcript.absorb(vk)?;
+    transcript.absorb(agg_pk)?;
+    transcript.absorb(agg_weight)?;
+    transcript.absorb(b_of_tau_com)?;
+    transcript.absorb(parsum_of_tau_com)?;
+    transcript.absorb(qx_of_tau_com)?;
+    transcript.absorb(qz_of_tau_com)?;
+    transcript.absorb(qx_of_tau_mul_tau_com)
+}
+
+/// Round 2 of the transcript (T_2): the commitment to the merged quotient. r is drawn only
+/// once it is fixed, so the quotient cannot be chosen to fit r.
+fn absorb_round_2(
+    transcript: &mut Transcript,
+    q_mrg_of_tau_com: &G1AffinePoint,
+) -> Result<(), HinTSError> {
+    transcript.absorb(q_mrg_of_tau_com)
+}
+
+/// Round 3 of the transcript (T_3): the claimed evaluations. χ_op is drawn only once they
+/// are fixed, so they cannot be adapted to the coefficient that batches their openings.
+fn absorb_round_3(
+    transcript: &mut Transcript,
+    parsum_of_r: &F,
+    parsum_of_r_div_ω: &F,
+    w_of_r: &F,
+    b_of_r: &F,
+    q_mrg_of_r: &F,
+) -> Result<(), HinTSError> {
+    transcript.absorb(parsum_of_r)?;
+    transcript.absorb(parsum_of_r_div_ω)?;
+    transcript.absorb(w_of_r)?;
+    transcript.absorb(b_of_r)?;
+    transcript.absorb(q_mrg_of_r)
+}
+
+/// re-derives the challenges (χ_Q, r, χ_op) from a signature, making the same transcript
+/// calls in the same order as `prove`
+fn derive_challenges(
+    vk: &VerificationKey,
+    π: &ThresholdSignature,
+) -> Result<(F, F, F), HinTSError> {
+    let mut transcript = Transcript::new();
+    absorb_round_1(
+        &mut transcript,
+        vk,
+        &π.agg_pk,
+        &π.agg_weight,
+        &π.b_of_tau_com,
+        &π.parsum_of_tau_com,
+        &π.qx_of_tau_com,
+        &π.qz_of_tau_com,
+        &π.qx_of_tau_mul_tau_com,
+    )?;
+    let χ_q: F = transcript.challenge(DST_QUOTIENT_MERGE);
+
+    absorb_round_2(&mut transcript, &π.q_mrg_of_tau_com)?;
+    let r: F = transcript.challenge(DST_EVALUATION_POINT);
+
+    absorb_round_3(
+        &mut transcript,
+        &π.parsum_of_r,
+        &π.parsum_of_r_div_ω,
+        &π.w_of_r,
+        &π.b_of_r,
+        &π.q_mrg_of_r,
+    )?;
+    let χ_op: F = transcript.challenge(DST_OPENING_BATCH);
+
+    Ok((χ_q, r, χ_op))
+}
+
+/// BLS: e(aPK, H(m)) = e([1]_1, σ)
+fn bls_check(
+    msg: &[u8],
+    vk: &VerificationKey,
+    π: &ThresholdSignature,
+) -> Result<bool, HinTSError> {
+    let lhs = <Curve as Pairing>::pairing(&π.agg_pk, hash_to_g2(msg)?);
+    let rhs = <Curve as Pairing>::pairing(vk.g_0, &π.agg_sig);
+    Ok(lhs == rhs)
+}
+
+/// the merged relation at r: P_mrg(r) = Q_mrg(r) · Z(r), from the claimed evaluations
+fn merged_relation_check(
+    vk: &VerificationKey,
+    π: &ThresholdSignature,
+    ω: F,
+    χ_q: F,
+    r: F,
+) -> bool {
+    // this takes logarithmic computation, but concretely efficient
+    let vanishing_of_r: F = r.pow([vk.n as u64]) - F::from(1);
+
+    // Z(r) = 0 exactly when r is in the domain, and at r = ω^{n-1} the division below would
+    // panic; r is a Fiat-Shamir output, so this has probability about n/2^255. Fail closed.
+    if vanishing_of_r == F::from(0) { return false; }
+
+    // compute L_{n-1}(r) using the relation L_i(x) = Z_V(x) / ( Z_V'(x) (x - ω^i) )
+    // where Z_V'(x)^-1 = x / N for N = |V|.
+    let ω_pow_n_minus_1 = ω.pow([(vk.n as u64) - 1]);
+    let l_n_minus_1_of_r =
+        (ω_pow_n_minus_1 / F::from(vk.n as u64)) * (vanishing_of_r / (r - ω_pow_n_minus_1));
+
+    // P1..P4 at r, as defined in `prove`; W(r) is the verification key's own weight
+    // polynomial, and the aggregate weight enters through the L_{n-1} term
+    let p1 = π.parsum_of_r - π.parsum_of_r_div_ω
+        - (π.w_of_r - π.agg_weight * l_n_minus_1_of_r) * π.b_of_r;
+    let p2 = π.b_of_r * π.b_of_r - π.b_of_r;
+    let p3 = l_n_minus_1_of_r * π.parsum_of_r;
+    let p4 = l_n_minus_1_of_r * (π.b_of_r - F::from(1));
+
+    merge_scalars(&[p1, p2, p3, p4], &χ_q) == π.q_mrg_of_r * vanishing_of_r
+}
+
+/// the single KZG opening at r of Q = Q_mrg + χ_op·PS + χ_op^2·B + χ_op^3·W; [Q(τ)]_1 is
+/// rebuilt from the commitments by homomorphism, with the verification key's own [W(τ)]_1
+fn opening_at_r_check(
+    vk: &VerificationKey,
+    π: &ThresholdSignature,
+    r: F,
+    χ_op: F,
+) -> bool {
+    let q_of_tau_com = merge_points(
+        &[π.q_mrg_of_tau_com, π.parsum_of_tau_com, π.b_of_tau_com, vk.w_of_tau_com],
+        &χ_op,
+    );
+    let q_of_r = merge_scalars(&[π.q_mrg_of_r, π.parsum_of_r, π.b_of_r, π.w_of_r], &χ_op);
+    verify_opening(vk, &q_of_tau_com, &r, &q_of_r, &π.opening_proof_r)
+}
+
+/// the KZG opening of ParSum at r / ω
+fn opening_at_r_div_ω_check(
+    vk: &VerificationKey,
+    π: &ThresholdSignature,
+    r_div_ω: F,
+) -> bool {
+    verify_opening(vk, &π.parsum_of_tau_com, &r_div_ω, &π.parsum_of_r_div_ω, &π.opening_proof_r_div_ω)
+}
+
+/// the generalized sumcheck B(x) SK(x) = ask + Q_z(x) Z(x) + Q_x(x) x, in the exponent
+fn sumcheck_check(
+    vk: &VerificationKey,
+    π: &ThresholdSignature,
+    e_qx_tau: &PairingOutput<Curve>,
+) -> bool {
+    let lhs = <Curve as Pairing>::pairing(&π.b_of_tau_com, &vk.sk_of_tau_com);
+    let x1 = <Curve as Pairing>::pairing(&π.qz_of_tau_com, &vk.z_of_tau_com);
+    let x3 = <Curve as Pairing>::pairing(&π.agg_pk, &vk.h_0);
+    lhs == x1 + *e_qx_tau + x3
+}
+
+/// the degree check e([Q_x(τ)]_1, [τ]_2) = e([Q_x(τ)·τ]_1, [1]_2)
+fn degree_check(
+    vk: &VerificationKey,
+    π: &ThresholdSignature,
+    e_qx_tau: &PairingOutput<Curve>,
+) -> bool {
+    *e_qx_tau == <Curve as Pairing>::pairing(&π.qx_of_tau_mul_tau_com, &vk.h_0)
 }
 
 // Generates a Schnorr proof of knowledge of the discrete log of the public key.
@@ -1076,63 +1263,6 @@ fn proof_of_knowledge_random_oracle(
     Ok(hasher.hash_to_field(&serialized_data, 1)[0])
 }
 
-// Fiat-Shamir transform to derive challenge for batch KZG argument
-fn kzg_batch_argument_random_oracle(
-    commitments: &[&G1AffinePoint],
-    evaluations: &[&F],
-) -> Result<F, HinTSError> {
-    const DST: &[u8] = b"HINTS_SIG_BLS12381:FIAT_SHAMIR_KZG_BATCH";
-    let mut serialized_data = Vec::new();
-    for &c in commitments {
-        c.serialize_compressed(&mut serialized_data)?;
-    }
-    for &e in evaluations {
-        e.serialize_compressed(&mut serialized_data)?;
-    }
-    let hasher = <DefaultFieldHasher<Sha256> as HashToField<F>>::new(DST);
-    Ok(hasher.hash_to_field(&serialized_data, 1)[0])
-}
-
-/// computes a hash for the Fiat-Shamir heuristic
-fn random_oracle(
-    sk_com: G2AffinePoint,
-    tau_com: G2AffinePoint,
-    agg_pk: G1AffinePoint,
-    agg_weight: F,
-    w_com: G1AffinePoint,
-    b_com: G1AffinePoint,
-    parsum_com: G1AffinePoint,
-    qx_com: G1AffinePoint,
-    qz_com: G1AffinePoint,
-    qx_mul_x_com: G1AffinePoint,
-    q1_com: G1AffinePoint,
-    q2_com: G1AffinePoint,
-    q3_com: G1AffinePoint,
-    q4_com: G1AffinePoint,
-) -> Result<F, HinTSError> {
-    let mut serialized_data = Vec::new();
-    sk_com.serialize_compressed(&mut serialized_data)?;
-    tau_com.serialize_compressed(&mut serialized_data)?;
-    agg_pk.serialize_compressed(&mut serialized_data)?;
-    agg_weight.serialize_compressed(&mut serialized_data)?;
-    w_com.serialize_compressed(&mut serialized_data)?;
-    b_com.serialize_compressed(&mut serialized_data)?;
-    parsum_com.serialize_compressed(&mut serialized_data)?;
-    qx_com.serialize_compressed(&mut serialized_data)?;
-    qz_com.serialize_compressed(&mut serialized_data)?;
-    qx_mul_x_com.serialize_compressed(&mut serialized_data)?;
-    q1_com.serialize_compressed(&mut serialized_data)?;
-    q2_com.serialize_compressed(&mut serialized_data)?;
-    q3_com.serialize_compressed(&mut serialized_data)?;
-    q4_com.serialize_compressed(&mut serialized_data)?;
-
-    const DST: &str = "HINTS_SIG_BLS12381:FIAT_SHAMIR_HINTS";
-    let hasher = <DefaultFieldHasher<Sha256> as HashToField<F>>::new(DST.as_bytes());
-    let field_elements = hasher.hash_to_field(&serialized_data, 1);
-
-    Ok(field_elements[0])
-}
-
 fn verify_opening(
     vp: &VerificationKey,
     commitment: &G1AffinePoint,
@@ -1147,74 +1277,6 @@ fn verify_opening(
     let rhs = <Curve as Pairing>::pairing(opening_proof.clone(), vp.h_1 - point_com);
 
     lhs == rhs
-}
-
-fn verify_openings_in_proof(
-    vk: &VerificationKey,
-    π: &ThresholdSignature,
-    r: F
-) -> Result<bool, HinTSError> {
-    //adjust the w_of_x_com
-    let adjustment = F::from(0) - π.agg_weight;
-    let adjustment_com = vk.l_n_minus_1_of_tau_com.mul(adjustment);
-    let w_of_x_com: G1AffinePoint = (vk.w_of_tau_com + adjustment_com).into();
-
-    let psw_of_r_argument = π.parsum_of_tau_com - vk.g_0.mul(π.parsum_of_r).into_affine();
-    let w_of_r_argument = w_of_x_com - vk.g_0.mul(π.w_of_r).into_affine();
-    let b_of_r_argument = π.b_of_tau_com - vk.g_0.mul(π.b_of_r).into_affine();
-    let psw_wff_q_of_r_argument = π.q1_of_tau_com - vk.g_0.mul(π.q1_of_r).into_affine();
-    let psw_check_q_of_r_argument = π.q3_of_tau_com - vk.g_0.mul(π.q3_of_r).into_affine();
-    let b_wff_q_of_r_argument = π.q2_of_tau_com - vk.g_0.mul(π.q2_of_r).into_affine();
-    let b_check_q_of_r_argument = π.q4_of_tau_com - vk.g_0.mul(π.q4_of_r).into_affine();
-
-    let s = kzg_batch_argument_random_oracle(
-        &[
-            &π.parsum_of_tau_com,
-            &w_of_x_com,
-            &π.b_of_tau_com,
-            &π.q1_of_tau_com,
-            &π.q3_of_tau_com,
-            &π.q2_of_tau_com,
-            &π.q4_of_tau_com
-        ],
-        &[
-            &π.parsum_of_r,
-            &π.w_of_r,
-            &π.b_of_r,
-            &π.q1_of_r,
-            &π.q3_of_r,
-            &π.q2_of_r,
-            &π.q4_of_r
-        ],
-    )?;
-
-    let merged_argument: G1AffinePoint = (psw_of_r_argument
-        + w_of_r_argument.mul(s.pow([1]))
-        + b_of_r_argument.mul(s.pow([2]))
-        + psw_wff_q_of_r_argument.mul(s.pow([3]))
-        + psw_check_q_of_r_argument.mul(s.pow([4]))
-        + b_wff_q_of_r_argument.mul(s.pow([5]))
-        + b_check_q_of_r_argument.mul(s.pow([6])))
-    .into_affine();
-
-    let lhs = <Curve as Pairing>::pairing(merged_argument, vk.h_0);
-    let rhs = <Curve as Pairing>::pairing(π.opening_proof_r, vk.h_1 - vk.h_0.mul(r).into_affine());
-    check_or_return_false!(lhs == rhs);
-
-    let ω: F = utils::nth_root_of_unity(vk.n).ok_or(
-        HinTSError::CryptographyCatastrophe(
-            format!("Unable to construct Radix2EvaluationDomain for n = {}", vk.n)
-        )
-    )?;
-    let r_div_ω: F = r / ω;
-
-    Ok(verify_opening(
-        vk,
-        &π.parsum_of_tau_com,
-        &r_div_ω,
-        &π.parsum_of_r_div_ω,
-        &π.opening_proof_r_div_ω,
-    ))
 }
 
 fn preprocess_qz_contributions(
@@ -1240,27 +1302,8 @@ fn preprocess_qz_contributions(
     q1_coms
 }
 
-fn compute_psw_poly(
-    weights: &Vec<Weight>,
-    bitmap: &Vec<F>
-) -> Result<DensePolynomial<F>, HinTSError> {
-    let n = weights.len(); // assumes power of 2 size
-
-    let mut parsum = F::from(0);
-    let mut evals = vec![];
-    for i in 0..n {
-        parsum += bitmap[i] * weights[i];
-        evals.push(parsum);
-    }
-
-    utils::interpolate_poly_over_mult_subgroup(&evals).ok_or(
-        HinTSError::CryptographyCatastrophe(
-            format!("Unable to construct Radix2EvaluationDomain for n = {}", evals.len())
-        )
-    )
-}
-
-/// computes the inner product between a vector of group elements and bitvector
+/// computes the inner product between a vector of group elements and bitvector;
+/// the sum runs in projective coordinates and is normalized once, at the end
 fn inner_product<T: AffineRepr>(
     elements: &Vec<T>,
     bitmap: &Vec<F>
@@ -1269,14 +1312,14 @@ fn inner_product<T: AffineRepr>(
         .iter()
         .zip(bitmap.iter())
         .filter(|(_, &bit)| bit == F::from(1))
-        .fold(T::zero(), |acc, (elem, _)| acc.add(elem).into_affine())
+        .map(|(elem, _)| elem)
+        .sum::<T::Group>()
+        .into_affine()
 }
 
-/// adds up all the group elements in a collection
+/// adds up all the group elements in a collection, in projective coordinates
 fn add<T: AffineRepr>(elements: impl IntoIterator<Item = T>) -> T {
-    elements
-        .into_iter()
-        .fold(T::zero(), |acc, x| acc.add(&x).into_affine())
+    elements.into_iter().sum::<T::Group>().into_affine()
 }
 
 /// hashes a byte array to an elliptic curve group element
@@ -1648,5 +1691,578 @@ mod tests {
             bad_vk.n = bad_n;
             assert!(!HinTS::verify(msg, &bad_vk, &π, (F::from(1), F::from(2))).unwrap());
         }
+    }
+
+    /// inner_product and add now sum in projective coordinates; pin them against the plain
+    /// affine fold they replaced, including the empty sum
+    #[test]
+    fn test_group_sums_match_affine_fold() {
+        let (_crs, ak, _vk, _sks, _epks) = sample_universe(8);
+        let bitmap: Vec<F> = [1u64, 0, 1, 1, 0, 0, 1, 1].iter().map(|&b| F::from(b)).collect();
+
+        let expected = ak
+            .qz_terms
+            .iter()
+            .zip(bitmap.iter())
+            .filter(|(_, &bit)| bit == F::from(1))
+            .fold(G1AffinePoint::zero(), |acc, (p, _)| (acc + p).into_affine());
+        assert_eq!(inner_product(&ak.qz_terms, &bitmap), expected);
+
+        // qz terms sum to zero by construction; pks repeat one key: a non-zero sum that exercises doubling
+        assert_eq!(add(ak.pks.clone()), ak.pks.iter().fold(G1AffinePoint::zero(), |acc, p| (acc + p).into_affine()));
+        assert_eq!(add(Vec::<G2AffinePoint>::new()), G2AffinePoint::zero());
+    }
+
+    /// The aggregate signature is 9 G1 points, 1 G2 point and 6 scalars. JNI moves it
+    /// uncompressed (96, 192 and 32 bytes each), and HintsLibraryBridge and TSS hard-code
+    /// that length, so pin it exactly.
+    #[test]
+    fn test_signature_size() {
+        let msg = b"size";
+        let (crs, ak, vk, sks, _) = sample_universe(8);
+        let sigs: HashMap<usize, PartialSignature> =
+            (0..7).map(|i| (i, HinTS::sign(msg, &sks[i]).unwrap())).collect();
+        let π = HinTS::aggregate(&crs, &ak, &vk, &sigs).unwrap();
+        assert_eq!(serialize(&π).unwrap().len(), 9 * 96 + 192 + 6 * 32);
+        assert_eq!(serialize(&π).unwrap().len(), 1248);
+    }
+
+    /// The outcome of each of verify's checks, all of them evaluated, so tests can assert
+    /// which check rejects a signature.
+    #[derive(Debug, PartialEq)]
+    struct CheckOutcomes {
+        bls: bool,
+        merged_relation: bool,
+        opening_at_r: bool,
+        opening_at_r_div_ω: bool,
+        sumcheck: bool,
+        degree: bool,
+    }
+
+    impl CheckOutcomes {
+        fn all_pass() -> Self {
+            CheckOutcomes {
+                bls: true,
+                merged_relation: true,
+                opening_at_r: true,
+                opening_at_r_div_ω: true,
+                sumcheck: true,
+                degree: true,
+            }
+        }
+    }
+
+    /// runs every check verify makes after its guards, without stopping at the first failure
+    fn run_all_checks(msg: &[u8], vk: &VerificationKey, π: &ThresholdSignature) -> CheckOutcomes {
+        let ω: F = utils::nth_root_of_unity(vk.n).unwrap();
+        let (χ_q, r, χ_op) = derive_challenges(vk, π).unwrap();
+        let e_qx_tau = <Curve as Pairing>::pairing(&π.qx_of_tau_com, &vk.h_1);
+        CheckOutcomes {
+            bls: bls_check(msg, vk, π).unwrap(),
+            merged_relation: merged_relation_check(vk, π, ω, χ_q, r),
+            opening_at_r: opening_at_r_check(vk, π, r, χ_op),
+            opening_at_r_div_ω: opening_at_r_div_ω_check(vk, π, r / ω),
+            sumcheck: sumcheck_check(vk, π, &e_qx_tau),
+            degree: degree_check(vk, π, &e_qx_tau),
+        }
+    }
+
+    /// partial signatures from every party in `parties`
+    fn sign_all(
+        msg: &[u8],
+        sks: &Vec<SecretKey>,
+        parties: impl IntoIterator<Item = usize>,
+    ) -> HashMap<usize, PartialSignature> {
+        parties
+            .into_iter()
+            .map(|i| (i, HinTS::sign(msg, &sks[i]).unwrap()))
+            .collect()
+    }
+
+    /// Aggregation and verification agree across domain sizes, from the smallest (a single
+    /// real party) up, and across participation: everyone, one signer, every other party.
+    #[test]
+    fn test_round_trip_across_sizes_and_participation() {
+        let msg = b"round trip";
+        for n in [2usize, 4, 8, 32] {
+            let (crs, ak, vk, sks, _) = sample_universe(n);
+            let participations = [
+                ("everyone", sign_all(msg, &sks, 0..n - 1)),
+                ("a single signer", sign_all(msg, &sks, [0])),
+                ("every other party", sign_all(msg, &sks, (0..n - 1).step_by(2))),
+            ];
+            for (label, sigs) in participations.iter() {
+                let π = HinTS::aggregate(&crs, &ak, &vk, sigs).unwrap();
+                // any positive weight clears (0, 1), so this pins the proof, not the threshold
+                assert!(
+                    HinTS::verify(msg, &vk, &π, (F::from(0), F::from(1))).unwrap(),
+                    "n = {}, {}", n, label
+                );
+                assert_eq!(run_all_checks(msg, &vk, &π), CheckOutcomes::all_pass(), "n = {}, {}", n, label);
+                // every party shares one key, so BLS pins how many parties signed but not which;
+                // weights vary across parties, so the claimed weight catches mis-credits between
+                // parties of different weight
+                assert_eq!(
+                    π.agg_weight,
+                    sigs.keys().fold(F::from(0), |acc, &i| acc + ak.weights[i]),
+                    "n = {}, {}", n, label
+                );
+            }
+        }
+    }
+
+    /// a universe, a signer set of every other party, and the honest witness for it
+    fn honest_setup(
+        n: usize,
+        msg: &[u8],
+    ) -> (CRS, AggregationKey, VerificationKey, HashMap<usize, PartialSignature>, Witness) {
+        let (crs, ak, vk, sks, _) = sample_universe(n);
+        let sigs = sign_all(msg, &sks, (0..n - 1).step_by(2));
+        let witness = assemble_witness(&ak, &sigs).unwrap();
+        (crs, ak, vk, sigs, witness)
+    }
+
+    /// The slots where each of P1..P4 fails, as [P1, P2, P3, P4]. Each relation is evaluated
+    /// at every domain point straight from the witness's values and the aggregation key's
+    /// weights, not from any polynomial. Slot i is ω^i, so L_{n-1}(ω^i) = [i = n-1], and:
+    ///   P1: PS(i) - PS(i-1 mod n) = (W(i) - w·[i = n-1])·b(i), with W(i) = ak.weights[i]
+    ///   P2: b(i)·b(i) = b(i)
+    ///   P3: [i = n-1]·PS(i) = 0
+    ///   P4: [i = n-1]·(b(i) - 1) = 0
+    fn failing_slots(ak: &AggregationKey, witness: &Witness) -> [Vec<usize>; 4] {
+        let n = ak.n;
+        let (b, ps, w) = (&witness.bitmap, &witness.parsum, witness.agg_weight);
+        let reserved = |i: usize| F::from(i == n - 1);
+        let mut failing: [Vec<usize>; 4] = Default::default();
+        for i in 0..n {
+            let relations = [
+                ps[i] - ps[(i + n - 1) % n] - (ak.weights[i] - w * reserved(i)) * b[i],
+                b[i] * b[i] - b[i],
+                reserved(i) * ps[i],
+                reserved(i) * (b[i] - F::from(1)),
+            ];
+            for (p, value) in relations.iter().enumerate() {
+                if *value != F::from(0) {
+                    failing[p].push(i);
+                }
+            }
+        }
+        failing
+    }
+
+    /// Proves a tampered witness and checks that the merged relation, and only the merged
+    /// relation, catches it. Every other check passes, so without the merged relation the
+    /// signature would verify. The claim must clear the threshold, or verify would reject
+    /// it for that alone.
+    fn assert_only_merged_relation_rejects(
+        crs: &CRS,
+        ak: &AggregationKey,
+        vk: &VerificationKey,
+        msg: &[u8],
+        witness: &Witness,
+        threshold: (F, F),
+    ) {
+        let (π, exact) = prove(crs, ak, vk, witness).unwrap();
+        assert!(!exact, "a tampered witness cannot satisfy all four relations");
+
+        let (numerator, denominator) = threshold;
+        assert!(denominator * π.agg_weight > numerator * vk.total_weight);
+
+        assert_eq!(
+            run_all_checks(msg, vk, &π),
+            CheckOutcomes { merged_relation: false, ..CheckOutcomes::all_pass() }
+        );
+        assert!(!HinTS::verify(msg, vk, &π, threshold).unwrap());
+    }
+
+    /// one copy of the signature per field, with only that field changed
+    fn tampered_copies(π: &ThresholdSignature) -> Vec<(&'static str, ThresholdSignature)> {
+        let g1 = G1AffinePoint::generator();
+        let g2 = G2AffinePoint::generator();
+        let bump_g1 = |p: G1AffinePoint| (p + g1).into_affine();
+        let bump_g2 = |p: G2AffinePoint| (p + g2).into_affine();
+        let bump_f = |x: F| x + F::from(1);
+
+        let mut copies = vec![];
+        macro_rules! tamper {
+            ($field:ident, $change:expr) => {{
+                let mut copy = π.clone();
+                copy.$field = $change(copy.$field);
+                copies.push((stringify!($field), copy));
+            }};
+        }
+        tamper!(agg_pk, bump_g1);
+        tamper!(agg_weight, bump_f);
+        tamper!(agg_sig, bump_g2);
+        tamper!(b_of_tau_com, bump_g1);
+        tamper!(qx_of_tau_com, bump_g1);
+        tamper!(qx_of_tau_mul_tau_com, bump_g1);
+        tamper!(qz_of_tau_com, bump_g1);
+        tamper!(parsum_of_tau_com, bump_g1);
+        tamper!(q_mrg_of_tau_com, bump_g1);
+        tamper!(opening_proof_r, bump_g1);
+        tamper!(opening_proof_r_div_ω, bump_g1);
+        tamper!(parsum_of_r, bump_f);
+        tamper!(parsum_of_r_div_ω, bump_f);
+        tamper!(w_of_r, bump_f);
+        tamper!(b_of_r, bump_f);
+        tamper!(q_mrg_of_r, bump_f);
+        copies
+    }
+
+    /// An honest witness divides exactly and yields a signature that passes every check;
+    /// the attacks below start from this.
+    #[test]
+    fn test_honest_witness_proves_exactly() {
+        let msg = b"honest";
+        let (crs, ak, vk, _sigs, witness) = honest_setup(8, msg);
+        assert_eq!(failing_slots(&ak, &witness), [vec![], vec![], vec![], vec![]]);
+        let (π, exact) = prove(&crs, &ak, &vk, &witness).unwrap();
+        assert!(exact);
+        assert_eq!(run_all_checks(msg, &vk, &π), CheckOutcomes::all_pass());
+    }
+
+    /// P1 stops weight inflation. Claiming more weight than the signers have moves the
+    /// reserved slot's -w, so the running sum no longer returns to zero by the recurrence: it
+    /// breaks at the reserved slot. P2, P3 and P4 still hold, and no other check sees w.
+    #[test]
+    fn test_merged_relation_rejects_weight_inflation() {
+        let msg = b"inflation";
+        let (crs, ak, vk, _sigs, mut witness) = honest_setup(8, msg);
+        witness.agg_weight += vk.total_weight;
+        assert_eq!(failing_slots(&ak, &witness), [vec![ak.n - 1], vec![], vec![], vec![]]);
+        assert_only_merged_relation_rejects(&crs, &ak, &vk, msg, &witness, (F::from(1), F::from(2)));
+    }
+
+    /// P1 is enforced at the wrap-around ω^0 too, and that step, PS(ω^0) - PS(ω^{n-1}) =
+    /// b_0·w_0, pins where the running sum starts. Without it, P1 on ω^1..ω^{n-1}, P3 and P4
+    /// give only w = PS(ω^0) + Σ_{i=1}^{n-2} b_i·w_i, with PS(ω^0) free. So claim δ more
+    /// weight, and start the running sum δ higher to match: every later step and the zero at
+    /// the reserved slot (P3) still hold, and P1 breaks at slot 0 alone.
+    #[test]
+    fn test_merged_relation_rejects_weight_inflation_at_wrap_around() {
+        let msg = b"wrap-around";
+        let (crs, ak, vk, _sigs, mut witness) = honest_setup(8, msg);
+        let n = ak.n;
+        let δ = vk.total_weight;
+        witness.agg_weight += δ;
+        let mut weights = ak.weights.clone();
+        weights[n - 1] = F::from(0) - witness.agg_weight;
+        witness.parsum = running_sums(&weights, &witness.bitmap).into_iter().map(|s| s + δ).collect();
+        assert_eq!(witness.parsum[n - 1], F::from(0)); // P3 holds
+        assert_eq!(failing_slots(&ak, &witness), [vec![0], vec![], vec![], vec![]]);
+        assert_only_merged_relation_rejects(&crs, &ak, &vk, msg, &witness, (F::from(1), F::from(2)));
+    }
+
+    /// P2 stops a signer from being counted twice. A bit of 2 doubles that signer's weight in
+    /// the running sum; scaling the aggregate key, the signature and the hint sums to match
+    /// keeps the BLS check, the sumcheck and the degree check satisfied, since all three are
+    /// linear in the bitmap. P1, P3 and P4 hold too, so only P2 notices.
+    #[test]
+    fn test_merged_relation_rejects_double_counted_signer() {
+        let msg = b"double count";
+        let (crs, ak, vk, sigs, mut witness) = honest_setup(8, msg);
+        let n = ak.n;
+        let n_inv = F::from(1) / F::from(n as u64);
+        let i = 0; // honest_setup's signers are every other party, starting at 0
+
+        witness.bitmap[i] = F::from(2);
+        witness.agg_weight += ak.weights[i];
+        let mut weights = ak.weights.clone();
+        weights[n - 1] = F::from(0) - witness.agg_weight;
+        witness.parsum = running_sums(&weights, &witness.bitmap);
+        witness.agg_pk = (ak.pks[i].mul(n_inv) + witness.agg_pk).into_affine();
+        witness.agg_sig = (sigs[&i].mul(n_inv) + witness.agg_sig).into_affine();
+        witness.qz_of_tau_com = (witness.qz_of_tau_com + ak.qz_terms[i]).into_affine();
+        witness.qx_of_tau_com = (witness.qx_of_tau_com + ak.qx_terms[i]).into_affine();
+        witness.qx_of_tau_mul_tau_com =
+            (witness.qx_of_tau_mul_tau_com + ak.qx_mul_tau_terms[i]).into_affine();
+
+        assert_eq!(failing_slots(&ak, &witness), [vec![], vec![i], vec![], vec![]]);
+        assert_only_merged_relation_rejects(&crs, &ak, &vk, msg, &witness, (F::from(0), F::from(1)));
+    }
+
+    /// P3 pins the running sum's constant: shifting every running sum by the same amount
+    /// leaves the recurrence P1 intact. This gains an attacker nothing, since P1 and P4
+    /// already fix the weight, but it is one of the four relations and the merge must not
+    /// lose it.
+    #[test]
+    fn test_merged_relation_rejects_shifted_running_sum() {
+        let msg = b"shift";
+        let (crs, ak, vk, _sigs, mut witness) = honest_setup(8, msg);
+        for value in witness.parsum.iter_mut() {
+            *value += F::from(1);
+        }
+        assert_eq!(failing_slots(&ak, &witness), [vec![], vec![], vec![ak.n - 1], vec![]]);
+        assert_only_merged_relation_rejects(&crs, &ak, &vk, msg, &witness, (F::from(0), F::from(1)));
+    }
+
+    /// P4 stops a zero-weight signer from claiming any weight at all. With the reserved bit
+    /// cleared, the reserved slot's -w drops out of the running sum, so P1 to P3 hold for
+    /// every claimed w, and the BLS check, the sumcheck and the degree check never see w.
+    /// The sumcheck does see the reserved slot: qz_terms[n-1] carries the other parties'
+    /// cross terms, so clearing the bit changes Q_z, which is why the test recomputes the
+    /// hint sums for the new bitmap. With them recomputed it holds, since the reserved
+    /// slot's key is zero and the aggregate key is unchanged. Without P4, one zero-weight
+    /// partial signature would make a majority signature.
+    #[test]
+    fn test_merged_relation_rejects_cleared_reserved_bit() {
+        let n = 8;
+        let msg = b"zero weight";
+        let (crs, _ak, _vk, sks, epks) = sample_universe(n);
+
+        // party 0 has no weight; everyone else carries the network
+        let mut weights = sample_weights(n - 1);
+        weights[0] = F::from(0);
+        let signer_info: HashMap<usize, (Weight, ExtendedPublicKey)> =
+            (0..n - 1).map(|i| (i, (weights[i], epks[i].clone()))).collect();
+        let (vk, ak) = HinTS::preprocess(n, &crs, &signer_info).unwrap();
+
+        // sanity: an honest signature that includes the zero-weight party still verifies
+        let honest = HinTS::aggregate(&crs, &ak, &vk, &sign_all(msg, &sks, [0, 1])).unwrap();
+        assert!(HinTS::verify(msg, &vk, &honest, (F::from(0), F::from(1))).unwrap());
+
+        // the attack: only party 0 signs, the reserved bit is cleared, and the claim is everything
+        let mut witness = assemble_witness(&ak, &sign_all(msg, &sks, [0])).unwrap();
+        witness.bitmap[n - 1] = F::from(0);
+        witness.agg_weight = vk.total_weight;
+        let mut weights_adj = ak.weights.clone();
+        weights_adj[n - 1] = F::from(0) - witness.agg_weight;
+        witness.parsum = running_sums(&weights_adj, &witness.bitmap);
+        witness.qz_of_tau_com = inner_product(&ak.qz_terms, &witness.bitmap);
+        witness.qx_of_tau_com = inner_product(&ak.qx_terms, &witness.bitmap);
+        witness.qx_of_tau_mul_tau_com = inner_product(&ak.qx_mul_tau_terms, &witness.bitmap);
+
+        assert_eq!(failing_slots(&ak, &witness), [vec![], vec![], vec![], vec![n - 1]]);
+        assert_only_merged_relation_rejects(&crs, &ak, &vk, msg, &witness, (F::from(1), F::from(2)));
+    }
+
+    /// every one of the 16 fields is load-bearing: changing any one of them is rejected
+    #[test]
+    fn test_verify_rejects_every_single_field_tampering() {
+        let msg = b"tamper";
+        let (crs, ak, vk, sks, _) = sample_universe(8);
+        let π = HinTS::aggregate(&crs, &ak, &vk, &sign_all(msg, &sks, 0..7)).unwrap();
+        let threshold = (F::from(0), F::from(1));
+        assert!(HinTS::verify(msg, &vk, &π, threshold).unwrap());
+
+        let copies = tampered_copies(&π);
+        assert_eq!(copies.len(), 16);
+        for (field, tampered) in copies {
+            assert!(!HinTS::verify(msg, &vk, &tampered, threshold).unwrap(), "{} tampered", field);
+        }
+    }
+
+    /// A merged quotient, commitment and evaluation together, can't be moved from one
+    /// signature onto another. [Q_mrg(τ)]_1 is absorbed in round 2, so the splice moves r,
+    /// and the evaluations and opening proofs in the spliced signature, all made at an
+    /// earlier r, fail at the new one.
+    #[test]
+    fn test_verify_rejects_spliced_merged_quotient() {
+        let msg = b"splice";
+        let (crs, ak, vk, sks, _) = sample_universe(8);
+        let everyone = HinTS::aggregate(&crs, &ak, &vk, &sign_all(msg, &sks, 0..7)).unwrap();
+        let some = HinTS::aggregate(&crs, &ak, &vk, &sign_all(msg, &sks, [1, 3, 5])).unwrap();
+        let threshold = (F::from(0), F::from(1));
+
+        // sanity: each donor verifies on its own; `some` is also an honest signer set
+        // without party 0, which the other honest signatures all include
+        assert!(HinTS::verify(msg, &vk, &everyone, threshold).unwrap());
+        assert!(HinTS::verify(msg, &vk, &some, threshold).unwrap());
+
+        let mut spliced = everyone.clone();
+        spliced.q_mrg_of_tau_com = some.q_mrg_of_tau_com;
+        spliced.q_mrg_of_r = some.q_mrg_of_r;
+        assert!(!HinTS::verify(msg, &vk, &spliced, threshold).unwrap());
+    }
+
+    /// Each Fiat-Shamir round absorbs exactly its own items: changing one moves that round's
+    /// challenge and every later one, and none earlier. In particular r depends on [Q_mrg],
+    /// which is what stops a prover from choosing the merged quotient after seeing r.
+    #[test]
+    fn test_transcript_rounds_bind_their_items() {
+        let msg = b"transcript";
+        let (crs, ak, vk, sks, _) = sample_universe(8);
+        let π = HinTS::aggregate(&crs, &ak, &vk, &sign_all(msg, &sks, 0..7)).unwrap();
+        let before = derive_challenges(&vk, &π).unwrap();
+
+        // the round that absorbs each field; 4 means no round does
+        let round_of = |field: &str| -> usize {
+            match field {
+                "agg_pk" | "agg_weight" | "b_of_tau_com" | "parsum_of_tau_com"
+                | "qx_of_tau_com" | "qz_of_tau_com" | "qx_of_tau_mul_tau_com" => 1,
+                "q_mrg_of_tau_com" => 2,
+                "parsum_of_r" | "parsum_of_r_div_ω" | "w_of_r" | "b_of_r" | "q_mrg_of_r" => 3,
+                "agg_sig" | "opening_proof_r" | "opening_proof_r_div_ω" => 4,
+                other => panic!("field {} is not classified", other),
+            }
+        };
+        for (field, tampered) in tampered_copies(&π) {
+            let after = derive_challenges(&vk, &tampered).unwrap();
+            let round = round_of(field);
+            assert_eq!(before.0 != after.0, round <= 1, "{}: χ_Q", field);
+            assert_eq!(before.1 != after.1, round <= 2, "{}: r", field);
+            assert_eq!(before.2 != after.2, round <= 3, "{}: χ_op", field);
+        }
+
+        // the whole verification key is part of round 1: changing any one of its 9 fields moves
+        // all three challenges. Each change keeps the key serializable: + 1 for the scalar, +
+        // the generator for points, and another valid domain size for n.
+        let g1 = G1AffinePoint::generator();
+        let g2 = G2AffinePoint::generator();
+        let bump_g1 = |p: G1AffinePoint| (p + g1).into_affine();
+        let bump_g2 = |p: G2AffinePoint| (p + g2).into_affine();
+        let bump_f = |x: F| x + F::from(1);
+        let double = |n: usize| n * 2;
+        let mut other_vks = vec![];
+        macro_rules! tamper_vk {
+            ($field:ident, $change:expr) => {{
+                let mut copy = vk.clone();
+                copy.$field = $change(copy.$field);
+                other_vks.push((stringify!($field), copy));
+            }};
+        }
+        tamper_vk!(n, double);
+        tamper_vk!(total_weight, bump_f);
+        tamper_vk!(g_0, bump_g1);
+        tamper_vk!(h_0, bump_g2);
+        tamper_vk!(h_1, bump_g2);
+        tamper_vk!(l_n_minus_1_of_tau_com, bump_g1);
+        tamper_vk!(w_of_tau_com, bump_g1);
+        tamper_vk!(sk_of_tau_com, bump_g2);
+        tamper_vk!(z_of_tau_com, bump_g2);
+        assert_eq!(other_vks.len(), 9);
+        for (field, other_vk) in other_vks {
+            let after = derive_challenges(&other_vk, &π).unwrap();
+            assert!(
+                before.0 != after.0 && before.1 != after.1 && before.2 != after.2,
+                "vk.{} is not bound by round 1", field
+            );
+        }
+    }
+
+    /// aggregate refuses inputs that cannot satisfy the relations, rather than emitting a
+    /// signature that fails verification: here, an aggregation key whose reserved slot
+    /// carries weight, which the running sum cannot reconcile with W
+    #[test]
+    fn test_aggregate_rejects_weight_on_reserved_slot() {
+        let msg = b"reserved";
+        let (crs, ak, vk, sks, _) = sample_universe(8);
+        let sigs = sign_all(msg, &sks, 0..7);
+        assert!(HinTS::aggregate(&crs, &ak, &vk, &sigs).is_ok());
+
+        let mut bad = ak.clone();
+        bad.weights[7] = F::from(1);
+        assert!(matches!(HinTS::aggregate(&crs, &bad, &vk, &sigs), Err(HinTSError::InvalidInput(_))));
+    }
+
+    /// keys preprocessed for the same parties with different weights do not combine:
+    /// aggregate either refuses, or produces a signature the other verification key rejects;
+    /// nothing panics. The weights are what differ: preprocess is deterministic, so the same
+    /// weights would give the same keys
+    #[test]
+    fn test_mismatched_keys_do_not_verify() {
+        let msg = b"mismatch";
+        let (crs, ak, _vk, sks, epks) = sample_universe(8);
+        let weights: Vec<F> = (0..7).map(|i| F::from(100 + i as u64)).collect();
+        let signer_info: HashMap<usize, (Weight, ExtendedPublicKey)> =
+            (0..7).map(|i| (i, (weights[i], epks[i].clone()))).collect();
+        let (other_vk, _other_ak) = HinTS::preprocess(8, &crs, &signer_info).unwrap();
+
+        let sigs = sign_all(msg, &sks, 0..7);
+        match HinTS::aggregate(&crs, &ak, &other_vk, &sigs) {
+            Err(_) => {}
+            Ok(π) => assert!(!HinTS::verify(msg, &other_vk, &π, (F::from(0), F::from(1))).unwrap()),
+        }
+    }
+
+    /// with no signers, aggregate still returns a signature, and verify rejects it
+    #[test]
+    fn test_empty_signer_set_does_not_verify() {
+        let msg = b"empty";
+        let (crs, ak, vk, _sks, _) = sample_universe(8);
+        let π = HinTS::aggregate(&crs, &ak, &vk, &HashMap::new()).unwrap();
+        assert!(!HinTS::verify(msg, &vk, &π, (F::from(0), F::from(1))).unwrap());
+    }
+
+    /// Proves a tampered witness that still satisfies all four relations, and checks that
+    /// one pairing check, and only that one, catches it: `outcomes` is what run_all_checks
+    /// must report. The claim must clear the threshold, so that without that check the
+    /// signature would verify.
+    fn assert_only_pairing_check_rejects(
+        crs: &CRS,
+        ak: &AggregationKey,
+        vk: &VerificationKey,
+        msg: &[u8],
+        witness: &Witness,
+        threshold: (F, F),
+        outcomes: CheckOutcomes,
+    ) {
+        let (π, exact) = prove(crs, ak, vk, witness).unwrap();
+        assert!(exact, "the tampering leaves the four relations intact");
+
+        let (numerator, denominator) = threshold;
+        assert!(denominator * π.agg_weight > numerator * vk.total_weight);
+
+        assert_eq!(run_all_checks(msg, vk, &π), outcomes);
+        assert!(!HinTS::verify(msg, vk, &π, threshold).unwrap());
+    }
+
+    /// The sumcheck ties the aggregate key to the bitmap. Only party 0 signs, but the witness
+    /// claims every party: its bitmap, running sums and hint sums are the honest ones for the
+    /// full set, so all four relations hold, and its aggregate key and signature are party 0's
+    /// alone, so BLS holds too. Without the sumcheck, one partial signature would make a
+    /// signature for the whole network.
+    #[test]
+    fn test_sumcheck_rejects_claimed_signers_who_did_not_sign() {
+        let n = 8;
+        let msg = b"sumcheck";
+        let (crs, ak, vk, sks, _) = sample_universe(n);
+        let n_inv = F::from(1) / F::from(n as u64);
+
+        let mut witness = assemble_witness(&ak, &sign_all(msg, &sks, 0..n - 1)).unwrap();
+        let sigs = sign_all(msg, &sks, [0]);
+        witness.agg_pk = ak.pks[0].mul(n_inv).into_affine();
+        witness.agg_sig = sigs[&0].mul(n_inv).into_affine();
+
+        assert_only_pairing_check_rejects(
+            &crs, &ak, &vk, msg, &witness, (F::from(1), F::from(2)),
+            CheckOutcomes { sumcheck: false, ..CheckOutcomes::all_pass() },
+        );
+    }
+
+    /// verify runs the degree check: a [Q_x(τ)·τ]_1 that disagrees with [Q_x(τ)]_1, absorbed
+    /// into the transcript exactly as the prover committed it, is caught by the degree check
+    /// alone. The change gains an attacker nothing; it pins that the check is wired in.
+    #[test]
+    fn test_degree_check_rejects_inconsistent_qx_mul_tau() {
+        let msg = b"degree";
+        let (crs, ak, vk, _sigs, mut witness) = honest_setup(8, msg);
+        witness.qx_of_tau_mul_tau_com =
+            (witness.qx_of_tau_mul_tau_com + G1AffinePoint::generator()).into_affine();
+
+        assert_only_pairing_check_rejects(
+            &crs, &ak, &vk, msg, &witness, (F::from(0), F::from(1)),
+            CheckOutcomes { degree: false, ..CheckOutcomes::all_pass() },
+        );
+    }
+
+    /// r is a Fiat-Shamir output, so it lands in the domain only with probability about
+    /// n/2^255. There Z(r) = 0, and at r = ω^{n-1} computing L_{n-1}(r) divides by zero,
+    /// which panics in ark-ff; the merged-relation check must return false instead. It is
+    /// called directly, since no signature can steer verify's r there.
+    #[test]
+    fn test_merged_relation_check_rejects_degenerate_r() {
+        let msg = b"degenerate r";
+        let (crs, ak, vk, sks, _) = sample_universe(8);
+        let π = HinTS::aggregate(&crs, &ak, &vk, &sign_all(msg, &sks, 0..7)).unwrap();
+        let ω: F = utils::nth_root_of_unity(vk.n).unwrap();
+        let (χ_q, r, _χ_op) = derive_challenges(&vk, &π).unwrap();
+
+        // sanity: at its own r, the honest signature satisfies the merged relation
+        assert!(merged_relation_check(&vk, &π, ω, χ_q, r));
+
+        let ω_pow_n_minus_1 = ω.pow([(vk.n as u64) - 1]);
+        assert!(!merged_relation_check(&vk, &π, ω, χ_q, ω_pow_n_minus_1));
     }
 }

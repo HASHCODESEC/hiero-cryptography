@@ -17,5 +17,9 @@ pub mod errors;
 
 mod kzg;
 mod utils;
+mod transcript;
 mod jni_util;
 mod jni_cache;
+
+#[cfg(test)]
+mod timing;
